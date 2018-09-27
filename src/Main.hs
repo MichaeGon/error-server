@@ -1,39 +1,58 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
-import Control.Applicative
-import Data.Maybe
-import Network.Wai (Application, rawPathInfo, requestHeaderHost)
-import Network.Wai.Application.Static (ssIndices, defaultWebAppSettings, staticApp)
-import Network.Wai.UrlMap (mapUrls, mount, mountRoot)
-import Network.Wai.Handler.Warp (run, defaultSettings, setPort)
+import StaticApp (staticAppWithAllowedRequests)
+
+import Control.Concurrent.Async (concurrently)
+import Data.Maybe 
+import Network.HTTP.Client (newManager, defaultManagerSettings)
+import Network.HTTP.Client.TLS (newTlsManager)
+import Network.HTTP.ReverseProxy (ProxyDest(..), WaiProxyResponse(..), waiProxyTo, defaultOnExc)
+import Network.Wai (Application, Request, requestHeaderHost, pathInfo)
+import Network.Wai.Handler.Warp (Port, run, defaultSettings, setPort)
 import Network.Wai.Handler.WarpTLS (runTLS, tlsSettings)
-import Network.Wai.Middleware.Vhost (vhost)
-import WaiAppStatic.Types (toPieces)
-import Debug.Trace
+import Network.Wai.Middleware.ForceSSL (forceSSL)
 import qualified Data.ByteString as B
 
 main :: IO ()
-main = run 80 routerApp
-
-routerApp :: Application
-routerApp = vhost [{-(checkPrefix "gitlab", undefined)-}] mainPageApp
+main = () <$ concurrently appHTTP appHTTPS
     where
-        checkPrefix p = maybe False (B.isPrefixOf p) . requestHeaderHost
+        appHTTP = newManager defaultManagerSettings >>= run httpPort . forceSSL . waiProxyTo redirectFunc defaultOnExc
+        appHTTPS = newTlsManager >>= runTLS tls (setPort httpsPort defaultSettings) . waiProxyTo reverseFunc defaultOnExc
+        tls = tlsSettings certFile keyFile
 
+httpPort :: Port
+httpPort = 80
 
-mainPageApp :: Application
-mainPageApp = mapUrls $ mount "jump" jumpApp
-                    <|> mountRoot errorHomeApp
+httpsPort :: Port
+httpsPort = 443
+
+certFile :: FilePath
+certFile = "certFilePath"
+
+keyFile :: FilePath
+keyFile = "keyFilePath"
+
+rootDir :: FilePath
+rootDir = "rootDirPath"
+
+redirectFunc :: Request -> IO WaiProxyResponse
+redirectFunc req = return $ WPRProxyDest $ ProxyDest {pdHost = fromJust $ requestHeaderHost req, pdPort = 443}
+
+reverseFunc :: Request -> IO WaiProxyResponse
+reverseFunc req
+    | isGitLab req = return . WPRProxyDest $ ProxyDest {pdHost = fromJust $ requestHeaderHost req, pdPort = 7000}
+    | otherwise = return $ WPRApplication errorHomeApp
+
+isChallenge :: Request -> Bool
+isChallenge = (== [".well-known", "acme-challenge"]) . take 2 . pathInfo
+
+isGitLab :: Request -> Bool
+isGitLab = checkPrefix "gitlab" 
+
+checkPrefix :: B.ByteString -> Request -> Bool
+checkPrefix p = maybe False (B.isPrefixOf p) . requestHeaderHost
 
 errorHomeApp :: Application
-errorHomeApp = staticAppWithDir "../error-home/home_dist"
-
-jumpApp :: Application
-jumpApp = staticAppWithDir "../error-home/jump_dist"
-
-staticAppWithDir :: FilePath -> Application
-staticAppWithDir path = staticApp $ settings {ssIndices = indices}
-    where
-        settings = defaultWebAppSettings path
-        indices = fromJust $ toPieces ["index.html"]
+errorHomeApp = staticAppWithAllowedRequests rootDir [isChallenge]
